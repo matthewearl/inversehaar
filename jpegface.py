@@ -4,6 +4,8 @@ import xml.etree.ElementTree
 
 import cv2
 import numpy
+import pulp
+
 
 BASIC_QUANT_TABLE = numpy.array([
     [16,  11,  10,  16,  24,  40,  51,  61],
@@ -15,6 +17,7 @@ BASIC_QUANT_TABLE = numpy.array([
     [49,  64,  78,  87, 103, 121, 120, 101],
     [72,  92,  95,  98, 112, 100, 103,  99]
 ])
+
 
 def make_quant_table(quality):
     # Clamp quality to 1 <= quality <= 100
@@ -32,13 +35,16 @@ def make_quant_table(quality):
     assert out.dtype == numpy.int32
     return out
 
+
 Stage = collections.namedtuple('Stage', ['threshold', 'weak_classifiers'])
 WeakClassifier = collections.namedtuple('WeakClassifier',
                           ['feature_idx', 'threshold', 'fail_val', 'pass_val'])
 Rect = collections.namedtuple('Rect', ['x', 'y', 'w', 'h', 'weight'])
 
+
 class Cascade(collections.namedtuple('_CascadeBase',
                                  ['width', 'height', 'stages', 'features'])):
+
     @staticmethod
     def _split_text_content(n):
         return n.text.strip().split(' ')
@@ -80,10 +86,12 @@ class Cascade(collections.namedtuple('_CascadeBase',
                 weight = float(sp[4])
                 feature.append(Rect(x, y, w, h, weight))
             features.append(feature)
-                
+
+        stages = stages[:3]
+
         return cls(width, height, stages, features)
 
-    def _feature_to_array(self, feature_idx):
+    def feature_to_array(self, feature_idx):
         out = numpy.zeros((self.height, self.width))
         feature = self.features[feature_idx]
         for x, y, w, h, weight in feature:
@@ -97,28 +105,80 @@ class Cascade(collections.namedtuple('_CascadeBase',
 
         im = im.astype(numpy.float64)
 
-        im /= numpy.std(im) * (self.height * self.width)
-        #im /= 256. * (self.height * self.width)
+        #im /= numpy.std(im) * (self.height * self.width)
+        im /= 256. * (self.height * self.width)
 
         for stage_idx, stage in enumerate(self.stages):
             total = 0
             for classifier in stage.weak_classifiers:
-                feature_array = self._feature_to_array(classifier.feature_idx)
+                feature_array = self.feature_to_array(classifier.feature_idx)
                 if numpy.sum(feature_array * im) >= classifier.threshold:
                     total += classifier.pass_val
                 else:
                     total += classifier.fail_val
+
             if total < stage.threshold:
                 print "Bailing out at stage {}".format(stage_idx)
                 return -stage_idx
         return 1
 
 
+class CascadeConstraints(object):
+    def __init__(self, cascade):
+        pixel_vars = {(x, y): pulp.LpVariable("pixel_{}_{}".format(x, y),
+                                              lowBound=0.0,
+                                              upBound=1.0)
+                      for y in range(cascade.height)
+                      for x in range(cascade.width)}
+        feature_vars = {idx: pulp.LpVariable("feature_{}".format(idx),
+                                             cat=pulp.LpBinary)
+                                for idx in range(len(cascade.features))}
+
+        constraints = []
+        for stage in cascade.stages:
+            # Feature var implies the feature dotted with the pixel values exceeds
+            # the classifier threshold.
+            for classifier in stage.weak_classifiers:
+                feature_array = cascade.feature_to_array(
+                                                        classifier.feature_idx)
+                if classifier.pass_val < classifier.fail_val:
+                    feature_array = -feature_array
+                constraints.append(sum(pixel_vars[x, y] * feature_array[y, x] / 
+                                               (cascade.width * cascade.height)
+                             for y in range(cascade.height)
+                             for x in range(cascade.width)
+                             if feature_array[y, x] != 0.) *
+                         (1. / classifier.threshold) -
+                         feature_vars[classifier.feature_idx] >= 0)
+
+            # Enforce that the sum of features present in this stage exceeds
+            # the stage threshold.
+            fail_val_total = sum(min(c.fail_val, c.pass_val)
+                                               for c in stage.weak_classifiers)
+            constraints.append(sum(abs(c.pass_val - c.fail_val) *
+                                                    feature_vars[c.feature_idx] 
+                         for c in stage.weak_classifiers) >=
+                                              stage.threshold - fail_val_total)
+
+        self.cascade = cascade
+        self.pixel_vars = pixel_vars
+        self.feature_vars = feature_vars
+        self._constraints = constraints
+
+    def __iter__(self):
+        return iter(self._constraints)
+
+
 def test_cascade_detect(im, cascade_file):
     my_cascade = Cascade.load(cascade_file)
 
     im = im[:]
-    gray = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
+    if len(im.shape) == 3:
+        gray = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
+    else:
+        assert len(im.shape) == 2
+        gray = im
+
     opencv_cascade = cv2.CascadeClassifier(cascade_file)
     objs = opencv_cascade.detectMultiScale(gray, 1.3, 5)
     for idx, (x, y, w, h) in enumerate(objs):
@@ -127,5 +187,44 @@ def test_cascade_detect(im, cascade_file):
 
         assert my_cascade.detect(gray[y:(y + h), x:(x + w)]) == 1
 
-test_cascade_detect(cv2.imread(sys.argv[1]), sys.argv[2])
+
+def find_min_face(cascade_file):
+    cascade = Cascade.load(cascade_file)
+    
+    constraints = CascadeConstraints(cascade)
+
+    prob = pulp.LpProblem("Reverse haar cascade", pulp.LpMinimize)
+    prob += sum(v for v in constraints.pixel_vars.values())
+    for c in constraints:
+        prob += c
+
+    prob.writeLP("min_face.lp")
+    prob.solve()
+    print "Status: {}".format(pulp.LpStatus[prob.status])
+    if prob.status != pulp.LpStatusOptimal:
+        raise Exception("Failed to find solution")
+
+    for v in prob.variables():
+        print "{}: {}".format(v.name, v.varValue)
+
+    sol = numpy.array([
+             [constraints.pixel_vars[x, y].varValue
+                                                 for x in range(cascade.width)]
+                  for y in range(cascade.height)])
+
+    numpy.set_printoptions(precision=4)
+    print sol
+
+    return sol
+    
+
+#test_cascade_detect(cv2.imread(sys.argv[1]), sys.argv[2])
+im = find_min_face(sys.argv[1])
+im *= 256.
+im_resized = cv2.resize(im, (im.shape[1] * 10, im.shape[0] * 10),
+                        interpolation=cv2.INTER_NEAREST)
+cv2.imwrite("out.png", im_resized)
+
+cascade = Cascade.load(sys.argv[1])
+assert cascade.detect(im) == 1
 
