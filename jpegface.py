@@ -87,7 +87,7 @@ class Cascade(collections.namedtuple('_CascadeBase',
                 feature.append(Rect(x, y, w, h, weight))
             features.append(feature)
 
-        stages = stages[:3]
+        stages = stages[:7]
 
         return cls(width, height, stages, features)
 
@@ -124,7 +124,7 @@ class Cascade(collections.namedtuple('_CascadeBase',
 
 
 class CascadeConstraints(object):
-    def __init__(self, cascade):
+    def __init__(self, cascade, epsilon=0.000001):
         pixel_vars = {(x, y): pulp.LpVariable("pixel_{}_{}".format(x, y),
                                               lowBound=0.0,
                                               upBound=1.0)
@@ -143,22 +143,24 @@ class CascadeConstraints(object):
                                                         classifier.feature_idx)
                 if classifier.pass_val < classifier.fail_val:
                     feature_array = -feature_array
+                adjusted_classifier_threshold = classifier.threshold + epsilon
                 constraints.append(sum(pixel_vars[x, y] * feature_array[y, x] / 
                                                (cascade.width * cascade.height)
                              for y in range(cascade.height)
                              for x in range(cascade.width)
                              if feature_array[y, x] != 0.) *
-                         (1. / classifier.threshold) -
+                         (1. / adjusted_classifier_threshold) -
                          feature_vars[classifier.feature_idx] >= 0)
 
             # Enforce that the sum of features present in this stage exceeds
             # the stage threshold.
             fail_val_total = sum(min(c.fail_val, c.pass_val)
                                                for c in stage.weak_classifiers)
+            adjusted_stage_threshold = stage.threshold + epsilon
             constraints.append(sum(abs(c.pass_val - c.fail_val) *
                                                     feature_vars[c.feature_idx] 
                          for c in stage.weak_classifiers) >=
-                                              stage.threshold - fail_val_total)
+                                     adjusted_stage_threshold - fail_val_total)
 
         self.cascade = cascade
         self.pixel_vars = pixel_vars
@@ -211,9 +213,6 @@ def find_min_face(cascade_file):
              [constraints.pixel_vars[x, y].varValue
                                                  for x in range(cascade.width)]
                   for y in range(cascade.height)])
-
-    numpy.set_printoptions(precision=4)
-    print sol
 
     return sol
     
