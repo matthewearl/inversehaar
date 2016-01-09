@@ -4,8 +4,16 @@ import xml.etree.ElementTree
 
 import cv2
 import numpy
-import pulp
 
+from docplex.mp.context import DOcloudContext
+from docplex.mp.environment import Environment
+from docplex.mp.model import Model
+
+DOCLOUD_URL = 'https://api-oaas.docloud.ibmcloud.com/job_manager/rest/v1/'
+docloud_context = DOcloudContext.make_default_context(DOCLOUD_URL)
+docloud_context.print_information()
+env = Environment()
+env.print_information()
 
 BASIC_QUANT_TABLE = numpy.array([
     [16,  11,  10,  16,  24,  40,  51,  61],
@@ -87,7 +95,7 @@ class Cascade(collections.namedtuple('_CascadeBase',
                 feature.append(Rect(x, y, w, h, weight))
             features.append(feature)
 
-        stages = stages[:5]
+        stages = stages[:]
 
         return cls(width, height, stages, features)
 
@@ -123,18 +131,17 @@ class Cascade(collections.namedtuple('_CascadeBase',
         return 1
 
 
-class CascadeConstraints(object):
+class CascadeModel(object):
     def __init__(self, cascade, epsilon=0.00000):
-        pixel_vars = {(x, y): pulp.LpVariable("pixel_{}_{}".format(x, y),
-                                              lowBound=0.0,
-                                              upBound=1.0)
+        model = Model("Inverse haar cascade", docloud_context=docloud_context)
+
+        pixel_vars = {(x, y): model.continuous_var(
+                               name="pixel_{}_{}".format(x, y), lb=0.0, ub=1.0)
                       for y in range(cascade.height)
                       for x in range(cascade.width)}
-        feature_vars = {idx: pulp.LpVariable("feature_{}".format(idx),
-                                             cat=pulp.LpBinary)
-                                for idx in range(len(cascade.features))}
+        feature_vars = {idx: model.binary_var(name="feature_{}".format(idx))
+                        for idx in range(len(cascade.features))}
 
-        constraints = []
         for stage in cascade.stages:
             # If the classifier's pass value is greater than its fail value,
             # then add a constraint equivalent to the following:
@@ -153,23 +160,22 @@ class CascadeConstraints(object):
             for classifier in stage.weak_classifiers:
                 feature_array = cascade.feature_to_array(
                                                         classifier.feature_idx)
+                feature_array /= (cascade.width * cascade.height)
                 if classifier.pass_val >= classifier.fail_val:
                     adjusted_classifier_threshold = (classifier.threshold +
                                                                        epsilon)
-                    constraints.append(sum(pixel_vars[x, y] *
-                                               feature_array[y, x] / 
-                                               (cascade.width * cascade.height)
-                                           for y in range(cascade.height)
-                                           for x in range(cascade.width)
-                                           if feature_array[y, x] != 0.) -
+                    model.add_constraint(sum(pixel_vars[x, y] *
+                                             feature_array[y, x]
+                                         for y in range(cascade.height)
+                                         for x in range(cascade.width)
+                                         if feature_array[y, x] != 0.) -
                         adjusted_classifier_threshold *
                         feature_vars[classifier.feature_idx] >= 0)
                 else:
                     adjusted_classifier_threshold = (classifier.threshold -
                                                                        epsilon)
-                    constraints.append(sum(pixel_vars[x, y] *
-                                               feature_array[y, x] / 
-                                               (cascade.width * cascade.height)
+                    model.add_constraint(sum(pixel_vars[x, y] *
+                                             feature_array[y, x]
                                            for y in range(cascade.height)
                                            for x in range(cascade.width)
                                            if feature_array[y, x] != 0.) +
@@ -181,7 +187,7 @@ class CascadeConstraints(object):
             # the stage threshold.
             fail_val_total = sum(c.fail_val for c in stage.weak_classifiers)
             adjusted_stage_threshold = stage.threshold + epsilon
-            constraints.append(sum((c.pass_val - c.fail_val) *
+            model.add_constraint(sum((c.pass_val - c.fail_val) *
                                                     feature_vars[c.feature_idx] 
                          for c in stage.weak_classifiers) >=
                                      adjusted_stage_threshold - fail_val_total)
@@ -189,10 +195,7 @@ class CascadeConstraints(object):
         self.cascade = cascade
         self.pixel_vars = pixel_vars
         self.feature_vars = feature_vars
-        self._constraints = constraints
-
-    def __iter__(self):
-        return iter(self._constraints)
+        self.model = model
 
 
 def test_cascade_detect(im, cascade_file):
@@ -217,29 +220,20 @@ def test_cascade_detect(im, cascade_file):
 def find_min_face(cascade_file):
     cascade = Cascade.load(cascade_file)
     
-    constraints = CascadeConstraints(cascade)
+    cascade_model = CascadeModel(cascade)
+    cascade_model.model.set_objective("min",
+                             sum(v for v in cascade_model.pixel_vars.values()))
 
-    prob = pulp.LpProblem("Reverse haar cascade", pulp.LpMinimize)
-    #prob += sum(v for v in constraints.pixel_vars.values())
-    prob += constraints.pixel_vars[0, 0]
-    for c in constraints:
-        prob += c
+    cascade_model.model.print_information()
+    cascade_model.model.export_as_lp(basename='docplex_%s', path='/home/matt')
 
-    prob.writeLP("min_face.lp")
-    prob.solve()
-    print "Status: {}".format(pulp.LpStatus[prob.status])
-    if prob.status != pulp.LpStatusOptimal:
+    if not cascade_model.model.solve():
         raise Exception("Failed to find solution")
+    cascade_model.model.report()
 
-    for v in prob.variables():
-        print "{}: {}".format(v.name, v.varValue)
-
-    def or_zero(f):
-        return f if f is not None else 0.0
-    sol = numpy.array([
-             [or_zero(constraints.pixel_vars[x, y].varValue)
-                                                 for x in range(cascade.width)]
-                  for y in range(cascade.height)])
+    sol = numpy.array([[cascade_model.pixel_vars[x, y].solution_value
+                        for x in range(cascade.width)]
+                       for y in range(cascade.height)])
 
     return sol
     
