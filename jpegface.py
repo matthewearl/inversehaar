@@ -106,10 +106,12 @@ class Cascade(collections.namedtuple('_CascadeBase',
             out[y:(y + h), x:(x + w)] += weight
         return out
 
-    def detect(self, im):
+    def detect(self, im, epsilon=0.00001):
         if im.shape != (self.height, self.width):
             im = cv2.resize(im, (self.width, self.height),
                            interpolation=cv2.INTER_AREA)
+
+        cv2.imwrite('t.png', im)
 
         im = im.astype(numpy.float64)
 
@@ -120,19 +122,21 @@ class Cascade(collections.namedtuple('_CascadeBase',
             total = 0
             for classifier in stage.weak_classifiers:
                 feature_array = self.feature_to_array(classifier.feature_idx)
-                if numpy.sum(feature_array * im) >= classifier.threshold:
+                if (numpy.sum(feature_array * im) >=
+                                               classifier.threshold - epsilon):
+                    if stage_idx == 1:
                     total += classifier.pass_val
                 else:
                     total += classifier.fail_val
 
-            if total < stage.threshold:
+            if total < stage.threshold - epsilon:
                 print "Bailing out at stage {}".format(stage_idx)
                 return -stage_idx
         return 1
 
 
 class CascadeModel(object):
-    def __init__(self, cascade, epsilon=0.00000):
+    def __init__(self, cascade, symmetrical=False, max_delta=None):
         model = Model("Inverse haar cascade", docloud_context=docloud_context)
 
         pixel_vars = {(x, y): model.continuous_var(
@@ -141,6 +145,14 @@ class CascadeModel(object):
                       for x in range(cascade.width)}
         feature_vars = {idx: model.binary_var(name="feature_{}".format(idx))
                         for idx in range(len(cascade.features))}
+
+        """
+        temp_img = cv2.imread('t.png', cv2.IMREAD_GRAYSCALE).astype(
+                                                          numpy.float64) / 256.
+        for y in range(cascade.height):
+            for x in range(cascade.width):
+                model.add_constraint(pixel_vars[x, y] - temp_img[y, x] == 0.)
+        """
 
         for stage in cascade.stages:
             # If the classifier's pass value is greater than its fail value,
@@ -161,36 +173,56 @@ class CascadeModel(object):
                 feature_array = cascade.feature_to_array(
                                                         classifier.feature_idx)
                 feature_array /= (cascade.width * cascade.height)
+                thr = classifier.threshold
+                feature_var = feature_vars[classifier.feature_idx]
+                feature_val = sum(pixel_vars[x, y] * feature_array[y, x]
+                                  for y in range(cascade.height)
+                                  for x in range(cascade.width)
+                                  if feature_array[y, x] != 0.)
                 if classifier.pass_val >= classifier.fail_val:
-                    adjusted_classifier_threshold = (classifier.threshold +
-                                                                       epsilon)
-                    model.add_constraint(sum(pixel_vars[x, y] *
-                                             feature_array[y, x]
-                                         for y in range(cascade.height)
-                                         for x in range(cascade.width)
-                                         if feature_array[y, x] != 0.) -
-                        adjusted_classifier_threshold *
-                        feature_vars[classifier.feature_idx] >= 0)
+                    big_num = 0.1 + thr - numpy.sum(numpy.min(
+                             [feature_array, numpy.zeros(feature_array.shape)],
+                             axis=0))
+                    model.add_constraint(feature_val - feature_var * big_num >=
+                                                                 thr - big_num)
                 else:
-                    adjusted_classifier_threshold = (classifier.threshold -
-                                                                       epsilon)
-                    model.add_constraint(sum(pixel_vars[x, y] *
-                                             feature_array[y, x]
-                                           for y in range(cascade.height)
-                                           for x in range(cascade.width)
-                                           if feature_array[y, x] != 0.) +
-                        adjusted_classifier_threshold *
-                        feature_vars[classifier.feature_idx] <=
-                                                 adjusted_classifier_threshold)
+                    big_num = 0.1 + numpy.sum(numpy.max(
+                             [feature_array, numpy.zeros(feature_array.shape)],
+                             axis=0)) - thr
+                    model.add_constraint(feature_val - feature_var * big_num <=
+                                                                           thr)
 
             # Enforce that the sum of features present in this stage exceeds
             # the stage threshold.
             fail_val_total = sum(c.fail_val for c in stage.weak_classifiers)
-            adjusted_stage_threshold = stage.threshold + epsilon
+            adjusted_stage_threshold = stage.threshold
             model.add_constraint(sum((c.pass_val - c.fail_val) *
                                                     feature_vars[c.feature_idx] 
                          for c in stage.weak_classifiers) >=
                                      adjusted_stage_threshold - fail_val_total)
+
+        # Constrain adjacent pixels to be within a given range.
+        if max_delta is not None:
+            for y in range(cascade.height - 1):
+                for x in range(cascade.width - 1):
+                    model.add_constraint(
+                        pixel_vars[x, y] - pixel_vars[x + 1, y] <= max_delta)
+                    model.add_constraint(
+                        pixel_vars[x, y] - pixel_vars[x + 1, y] >= -max_delta)
+                    model.add_constraint(
+                        pixel_vars[x, y] - pixel_vars[x, y + 1] <= max_delta)
+                    model.add_constraint(
+                        pixel_vars[x, y] - pixel_vars[x, y + 1] >= -max_delta)
+
+        if symmetrical:
+            for y in range(cascade.height):
+                for x in range(cascade.width // 2):
+                    model.add_constraint(
+                        pixel_vars[x, y] -
+                        pixel_vars[cascade.width - x - 1, y] <= 0.3)
+                    model.add_constraint(
+                        pixel_vars[x, y] -
+                        pixel_vars[cascade.width - x - 1, y] >= -0.3)
 
         self.cascade = cascade
         self.pixel_vars = pixel_vars
@@ -211,6 +243,7 @@ def test_cascade_detect(im, cascade_file):
     opencv_cascade = cv2.CascadeClassifier(cascade_file)
     objs = opencv_cascade.detectMultiScale(gray, 1.3, 5)
     for idx, (x, y, w, h) in enumerate(objs):
+        print "{} {} {} {}".format(x, y, w, h)
         cv2.rectangle(im, (x, y), (x + w, y + h), (255, 0, 0), 2)
         cv2.imwrite('out{:02d}.jpg'.format(idx), im)
 
@@ -221,8 +254,8 @@ def find_min_face(cascade_file):
     cascade = Cascade.load(cascade_file)
     
     cascade_model = CascadeModel(cascade)
-    cascade_model.model.set_objective("min",
-                             sum(v for v in cascade_model.pixel_vars.values()))
+    #cascade_model.model.set_objective("min",
+    #                         sum(v for v in cascade_model.pixel_vars.values()))
 
     cascade_model.model.print_information()
     cascade_model.model.export_as_lp(basename='docplex_%s', path='/home/matt')
@@ -239,6 +272,7 @@ def find_min_face(cascade_file):
     
 
 #test_cascade_detect(cv2.imread(sys.argv[1]), sys.argv[2])
+#raise SystemExit
 im = find_min_face(sys.argv[1])
 im *= 256.
 im_resized = cv2.resize(im, (im.shape[1] * 10, im.shape[0] * 10),
