@@ -47,8 +47,72 @@ def make_quant_table(quality):
 Stage = collections.namedtuple('Stage', ['threshold', 'weak_classifiers'])
 WeakClassifier = collections.namedtuple('WeakClassifier',
                           ['feature_idx', 'threshold', 'fail_val', 'pass_val'])
-Rect = collections.namedtuple('Rect', ['x', 'y', 'w', 'h', 'weight'])
+Rect = collections.namedtuple('Rect',
+                              ['x', 'y', 'w', 'h', 'tilted', 'weight'])
 
+class TiltedGrid(object):
+    def __init__(self, width, height):
+        self._width = width
+        self._height = height
+        
+        self._cell_indices = {(d, x, y): 4 * ((width * y) + x) + d
+                              for y in range(height)
+                              for x in range(width)
+                              for d in range(4)}
+        self._cell_points = numpy.zeros((width * height * 4, 2))
+
+        for y in range(height):
+            for x in range(width):
+                self._cell_points[self._cell_indices[0, x, y], :] = \
+                        numpy.array([x + 0.5, y + 0.25])
+                self._cell_points[self._cell_indices[1, x, y], :] = \
+                        numpy.array([x + 0.75, y + 0.5])
+                self._cell_points[self._cell_indices[2, x, y], :] = \
+                        numpy.array([x + 0.5, y + 0.75])
+                self._cell_points[self._cell_indices[3, x, y], :] = \
+                        numpy.array([x + 0.25, y + 0.5])
+
+    @property
+    def vec_size(self):
+        return self._width * self._height * 4
+
+    def _rect_to_bounds(self, r):
+        if not r.tilted:
+            dirs = numpy.matrix([[0, 1], [-1, 0], [0, -1], [1, 0]])
+        else:
+            dirs = numpy.matrix([[-1, 1], [-1, -1], [1, -1], [1, 1]])
+        limits = numpy.matrix([[r.y, -(r.x + r.w), -(r.y + r.h), r.x]]).T
+
+        return dirs, limits
+
+    def rect_vec(self, r):
+        dirs, limits = self._rect_to_bounds(r)
+        out = numpy.all(numpy.array(dirs * numpy.matrix(self._cell_points).T)
+                                                                     >= limits,
+                        axis=0)
+        return numpy.array(out)[0]
+        
+    def render_vec(self, vec, im_width, im_height):
+        out_im = numpy.zeros((im_height, im_width), dtype=numpy.uint8)
+
+        vec = (vec * 255.).astype(numpy.uint8)
+
+        tris = numpy.array([[[0, 0], [1, 0], [0.5, 0.5]],
+                            [[1, 0], [1, 1], [0.5, 0.5]],
+                            [[1, 1], [0, 1], [0.5, 0.5]],
+                            [[0, 1], [0, 0], [0.5, 0.5]]])
+
+        scale_factor = numpy.array([im_width / self._width,
+                                    im_height / self._height])
+        for y in range(self._height):
+            for x in range(self._width):
+                for d in range(4):
+                    points = (tris[d] + numpy.array([x, y])) * scale_factor 
+                    cv2.fillConvexPoly(
+                                   img=out_im,
+                                   points=points.astype(numpy.int32),
+                                   color=int(vec[self._cell_indices[d, x, y]]))
+        return out_im
 
 class Cascade(collections.namedtuple('_CascadeBase',
                                  ['width', 'height', 'stages', 'features'])):
@@ -124,7 +188,6 @@ class Cascade(collections.namedtuple('_CascadeBase',
                 feature_array = self.feature_to_array(classifier.feature_idx)
                 if (numpy.sum(feature_array * im) >=
                                                classifier.threshold - epsilon):
-                    if stage_idx == 1:
                     total += classifier.pass_val
                 else:
                     total += classifier.fail_val
@@ -219,15 +282,19 @@ class CascadeModel(object):
                 for x in range(cascade.width // 2):
                     model.add_constraint(
                         pixel_vars[x, y] -
-                        pixel_vars[cascade.width - x - 1, y] <= 0.3)
-                    model.add_constraint(
-                        pixel_vars[x, y] -
-                        pixel_vars[cascade.width - x - 1, y] >= -0.3)
+                        pixel_vars[cascade.width - x - 1, y] == 0.)
 
         self.cascade = cascade
         self.pixel_vars = pixel_vars
         self.feature_vars = feature_vars
         self.model = model
+
+    def set_best_fit_objective(self):
+        self.model.set_objective("max",
+                    sum((c.pass_val - c.fail_val) *
+                                               self.feature_vars[c.feature_idx] 
+                        for s in self.cascade.stages
+                        for c in s.weak_classifiers))
 
 
 def test_cascade_detect(im, cascade_file):
@@ -256,6 +323,8 @@ def find_min_face(cascade_file):
     cascade_model = CascadeModel(cascade)
     #cascade_model.model.set_objective("min",
     #                         sum(v for v in cascade_model.pixel_vars.values()))
+    cascade_model.set_best_fit_objective()
+    cascade_model.model.set_time_limit(1 * 3600.)
 
     cascade_model.model.print_information()
     cascade_model.model.export_as_lp(basename='docplex_%s', path='/home/matt')
