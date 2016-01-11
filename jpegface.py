@@ -15,34 +15,6 @@ docloud_context.print_information()
 env = Environment()
 env.print_information()
 
-BASIC_QUANT_TABLE = numpy.array([
-    [16,  11,  10,  16,  24,  40,  51,  61],
-    [12,  12,  14,  19,  26,  58,  60,  55],
-    [14,  13,  16,  24,  40,  57,  69,  56],
-    [14,  17,  22,  29,  51,  87,  80,  62],
-    [18,  22,  37,  56,  68, 109, 103,  77],
-    [24,  35,  55,  64,  81, 104, 113,  92],
-    [49,  64,  78,  87, 103, 121, 120, 101],
-    [72,  92,  95,  98, 112, 100, 103,  99]
-])
-
-
-def make_quant_table(quality):
-    # Clamp quality to 1 <= quality <= 100
-    quality = min(100, max(1, quality))
-
-    # Scale factor is then defined piece-wise, and is inversely related to
-    # quality.
-    if quality < 50:
-        scale_factor = 5000 // quality
-    else:
-        scale_factor = 200 - quality * 2
-
-    out = numpy.clip((BASIC_QUANT_TABLE * scale_factor + 50) / 100, 0, 255)
-                
-    assert out.dtype == numpy.int32
-    return out
-
 
 Stage = collections.namedtuple('Stage', ['threshold', 'weak_classifiers'])
 WeakClassifier = collections.namedtuple('WeakClassifier',
