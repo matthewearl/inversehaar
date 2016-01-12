@@ -31,7 +31,7 @@ class TiltedGrid(object):
                               for y in range(height)
                               for x in range(width)
                               for d in range(4)}
-        self.cell_names = ['{}_{}_{}'.format(x, y, "NESW"[d])
+        self.cell_names = ['cell_{}_{}_{}'.format(x, y, "NESW"[d])
                            for y in range(height)
                            for x in range(width)
                            for d in range(4)]
@@ -221,9 +221,9 @@ class CascadeModel(object):
                 feature_vec /= (cascade.width * cascade.height * 4.)
                 thr = classifier.threshold
                 feature_var = feature_vars[classifier.feature_idx]
-                feature_val = sum(cell_vars[i] * feature_var[i]
-                                  for i in range(grid.vec_size)
-                                  if feature_var[i] != 0.)
+                feature_val = sum(cell_vars[i] * feature_vec[i]
+                                  for i in numpy.argwhere(
+                                                  feature_vec != 0.).flatten())
                 if classifier.pass_val >= classifier.fail_val:
                     big_num = 0.1 + thr - numpy.sum(numpy.min(
                              [feature_vec, numpy.zeros(feature_vec.shape)],
@@ -246,6 +246,7 @@ class CascadeModel(object):
                          for c in stage.weak_classifiers) >=
                                      adjusted_stage_threshold - fail_val_total)
 
+        """
         # Constrain adjacent pixels to be within a given range.
         if max_delta is not None:
             for y in range(cascade.height - 1):
@@ -265,11 +266,13 @@ class CascadeModel(object):
                     model.add_constraint(
                         pixel_vars[x, y] -
                         pixel_vars[cascade.width - x - 1, y] == 0.)
+        """
 
         self.cascade = cascade
-        self.pixel_vars = pixel_vars
+        self.cell_vars = cell_vars
         self.feature_vars = feature_vars
         self.model = model
+        self.grid = grid
 
     def set_best_fit_objective(self):
         self.model.set_objective("max",
@@ -306,7 +309,7 @@ def find_min_face(cascade_file):
     #cascade_model.model.set_objective("min",
     #                         sum(v for v in cascade_model.pixel_vars.values()))
     cascade_model.set_best_fit_objective()
-    cascade_model.model.set_time_limit(1 * 3600.)
+    cascade_model.model.set_time_limit(1200.)
 
     cascade_model.model.print_information()
     cascade_model.model.export_as_lp(basename='docplex_%s', path='/home/matt')
@@ -315,21 +318,17 @@ def find_min_face(cascade_file):
         raise Exception("Failed to find solution")
     cascade_model.model.report()
 
-    sol = numpy.array([[cascade_model.pixel_vars[x, y].solution_value
-                        for x in range(cascade.width)]
-                       for y in range(cascade.height)])
-
-    return sol
+    sol_vec = numpy.array([v.solution_value for v in cascade_model.cell_vars])
+    return cascade_model.grid.render_vec(sol_vec,
+                                         20 * cascade.width,
+                                         20 * cascade.height)
     
 
-test_cascade_detect(cv2.imread(sys.argv[1]), sys.argv[2])
-raise SystemExit
+#test_cascade_detect(cv2.imread(sys.argv[1]), sys.argv[2])
+#raise SystemExit
 im = find_min_face(sys.argv[1])
-im *= 256.
-im_resized = cv2.resize(im, (im.shape[1] * 10, im.shape[0] * 10),
-                        interpolation=cv2.INTER_NEAREST)
-cv2.imwrite("out.png", im_resized)
+cv2.imwrite("out.png", im)
 
-cascade = Cascade.load(sys.argv[1])
-assert cascade.detect(im) == 1
+#cascade = Cascade.load(sys.argv[1])
+#assert cascade.detect(im) == 1
 
