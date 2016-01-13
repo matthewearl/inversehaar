@@ -1,3 +1,35 @@
+# Copyright (c) 2015 Matthew Earl
+# 
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+# 
+#     The above copyright notice and this permission notice shall be included
+#     in all copies or substantial portions of the Software.
+# 
+#     THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+#     OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+#     MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+#     NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+#     DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+#     OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+#     USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+"""
+Invert OpenCV haar cascades.
+
+"""
+
+
+__all__ = (
+    'inverse_haar',
+)
+
+
 import collections
 import sys
 import xml.etree.ElementTree
@@ -9,6 +41,7 @@ from docplex.mp.context import DOcloudContext
 from docplex.mp.environment import Environment
 from docplex.mp.model import Model
 
+
 DOCLOUD_URL = 'https://api-oaas.docloud.ibmcloud.com/job_manager/rest/v1/'
 docloud_context = DOcloudContext.make_default_context(DOCLOUD_URL)
 docloud_context.print_information()
@@ -16,14 +49,46 @@ env = Environment()
 env.print_information()
 
 
-Stage = collections.namedtuple('Stage', ['threshold', 'weak_classifiers'])
-WeakClassifier = collections.namedtuple('WeakClassifier',
-                          ['feature_idx', 'threshold', 'fail_val', 'pass_val'])
-Rect = collections.namedtuple('Rect',
-                              ['x', 'y', 'w', 'h', 'tilted', 'weight'])
+# Grid classes
+
+class Grid(object):
+    """
+    A division of an image area into cells.
+
+    For example, `SquareGrid` divides the image into pixels.
+
+    Cell values are represented with "cell vectors", so for example,
+    `Grid.render_cell_vec` will take a cell vector and produce an image.
+
+    """
+
+    @property
+    def num_cells(self):
+        """The number of cells in this grid"""
+        raise NotImplementedError
+
+    def rect_to_cell_vec(self, r):
+        """
+        Return a boolean cell vector corresponding with the input rectangle.
+
+        Elements of the returned vector are True if and only if the
+        corresponding cells fall within the input rectangle
+
+        """
+        raise NotImplementedError
+
+    def render_cell_vec(self, vec, im_width, im_height):
+        """Render an image, using a cell vector and image dimensions."""
+        raise NotImplementedError
 
 
-class SquareGrid(object):
+class SquareGrid(Grid):
+    """
+    A grid where cells correspond with pixels.
+
+    This grid type is used for cascades which do not contain diagonal features.
+
+    """
     def __init__(self, width, height):
         self._width = width
         self._height = height
@@ -31,23 +96,39 @@ class SquareGrid(object):
                            for y in range(height) for x in range(width)]
 
     @property
-    def vec_size(self):
+    def num_cells(self):
         return self._width * self._height
 
-    def rect_vec(self, r):
+    def rect_to_cell_vec(self, r):
         assert not r.tilted
         out = numpy.zeros((self._width, self._height), dtype=numpy.bool)
         out[r.y:r.y + r.h, r.x:r.x + r.w] = True
         return out.flatten()
 
-    def render_vec(self, vec, im_width, im_height):
-        im = (vec * 255.).astype(numpy.uint8).reshape(self._height,
-                                                      self._width)
+    def render_cell_vec(self, vec, im_width, im_height):
+        im = vec.reshape(self._height, self._width)
         return cv2.resize(im, (im_width, im_height),
                           interpolation=cv2.INTER_NEAREST)
         
 
-class TiltedGrid(object):
+class TiltedGrid(Grid):
+    """
+    A square grid, but each square consists of 4 cells.
+
+    The squares are cut diagonally, resulting in a north, east, south and west
+    triangle for each cell.
+
+    This grid type is used for cascades which contain diagonal features: The
+    idea is that the area which a diagonal feature should be integrated can be
+    represented exactly by this structure.
+
+    Unfortunately, this is not quite accurate: OpenCV's trainer and detector
+    always resizes its images so that pixels correspond with one grid cell. As
+    such cascades which contain diagonal features will not be accurately
+    inverted by this script, however, they will have more detail as a result of
+    the grid square subdivision.
+
+    """
     def __init__(self, width, height):
         self._width = width
         self._height = height
@@ -74,7 +155,7 @@ class TiltedGrid(object):
                         numpy.array([x + 0.25, y + 0.5])
 
     @property
-    def vec_size(self):
+    def num_cells(self):
         return self._width * self._height * 4
 
     def _rect_to_bounds(self, r):
@@ -90,14 +171,14 @@ class TiltedGrid(object):
 
         return dirs, limits
 
-    def rect_vec(self, r):
+    def rect_to_cell_vec(self, r):
         dirs, limits = self._rect_to_bounds(r)
         out = numpy.all(numpy.array(dirs * numpy.matrix(self._cell_points).T)
                                                                      >= limits,
                         axis=0)
         return numpy.array(out)[0]
 
-    def render_vec(self, vec, im_width, im_height):
+    def render_cell_vec(self, vec, im_width, im_height):
         out_im = numpy.zeros((im_height, im_width), dtype=vec.dtype)
 
         tris = numpy.array([[[0, 0], [1, 0], [0.5, 0.5]],
@@ -117,15 +198,119 @@ class TiltedGrid(object):
                                    color=vec[self._cell_indices[d, x, y]])
         return out_im 
 
+
+# Cascade definition
+
+Stage = collections.namedtuple('Stage', ['threshold', 'weak_classifiers'])
+Stage.__doc__ = \
+"""
+A stage in an OpenCV cascade.
+
+.. attribute:: weak_classifiers
+
+    A list of weak classifiers in this stage.
+
+.. attribute:: threshold
+
+    The value that the weak classifiers must exceed for this stage to pass.
+
+"""
+
+
+WeakClassifier = collections.namedtuple('WeakClassifier',
+                          ['feature_idx', 'threshold', 'fail_val', 'pass_val'])
+WeakClassifier.__doc__ = \
+"""
+A weak classifier in an OpenCV cascade.
+
+.. attribute:: feature_idx
+
+    Feature associated with this classifier.
+
+.. attribute:: threshold
+
+    The value that this feature dotted with the input image must exceed for the
+    feature to have passed.
+
+.. attribute:: fail_val
+
+    The value contributed to the stage threshold if this classifier fails.
+
+.. attribute:: pass_val
+
+    The value contributed to the stage threshold if this classifier passes.
+
+"""
+
+
+Rect = collections.namedtuple('Rect',
+                              ['x', 'y', 'w', 'h', 'tilted', 'weight'])
+Rect.__doc__ = \
+"""
+A rectangle in an OpenCV cascade.
+
+Two or more of these make up a feature.
+
+.. attribute:: x, y
+    
+    Coordinates of the rectangle.
+
+.. attribute:: w, h
+
+    Width and height of the rectangle, respectively.
+
+.. attribute:: tilted
+
+    If true, the rectangle is to be considered rotated 45 degrees clockwise
+    about its top-left corner. (+X is right, +Y is down.)
+    
+.. attribute:: weight
+
+    The value this rectangle contributes to the feature.
+
+"""
+
+
 class Cascade(collections.namedtuple('_CascadeBase',
                  ['width', 'height', 'stages', 'features', 'tilted', 'grid'])):
+    """
+    Pythonic interface to an OpenCV cascade file.
 
+    .. attribute:: width
+        
+        Width of the cascade grid.
+
+    .. attribute:: height
+
+        Height of the cascade grid.
+
+    .. attribute:: stages
+
+        List of :class:`.Stage` objects.
+
+    .. attribute:: features
+
+        List of features. Each feature is in turn a list of :class:`.Rect`s. 
+
+    .. attribute:: tilted
+
+        True if any of the features are tilted.
+
+    .. attribute:: grid
+
+        A :class:`.Grid` object suitable for use with the cascade.
+
+    """
     @staticmethod
     def _split_text_content(n):
         return n.text.strip().split(' ')
 
     @classmethod
     def load(cls, fname):
+        """
+        Parse an OpenCV haar cascade XML file.
+
+        """
         root = xml.etree.ElementTree.parse(fname)
 
         width = int(root.find('./cascade/width').text.strip())
@@ -139,8 +324,8 @@ class Cascade(collections.namedtuple('_CascadeBase',
             for classifier_node in stage_node.findall('weakClassifiers/_'):
                 sp = cls._split_text_content(
                                        classifier_node.find('./internalNodes'))
-                assert sp[0] == "0"
-                assert sp[1] == "-1"
+                if sp[0] != "0" or sp[1] != "-1":
+                    raise Exception("Only simple cascade files are supported")
                 feature_idx = int(sp[2])
                 threshold = float(sp[3])
 
@@ -178,80 +363,110 @@ class Cascade(collections.namedtuple('_CascadeBase',
 
         return cls(width, height, stages, features, tilted, grid)
 
-    def detect(self, im, epsilon=0.00001):
+    def detect(self, im, epsilon=0.00001, scale_by_std_dev=False):
+        """
+        Apply the cascade forwards on a potential face image.
+
+        The algorithm is relatively slow compared to the integral image
+        implementation, but is relatively terse and consequently useful for
+        debugging.
+
+        :param im:
+            
+            Image to apply the detector to.
+
+        :param epsilon:
+
+            Maximum rounding error to account for. This biases the classifier
+            and stage thresholds towards passing. As a result, passing too
+            large a value may result in false positive detections.
+
+        :param scale_by_std_dev:
+
+            If true, divide the input image by its standard deviation before
+            processing. This simulates OpenCV's algorithm, however the reverse
+            haar mapping implemented by this script does not account for the
+            standard deviation divide, so to get the forward version of
+            `inverse_haar`, pass False.
+
+        """
         im = im.astype(numpy.float64)
 
         im = cv2.resize(im, (self.width, self.height),
                         interpolation=cv2.INTER_AREA)
 
-        im /= numpy.std(im) * (im.shape[1] * im.shape[0])
-        #im /= 256. * (im.shape[1] * im.shape[0])
+        scale_factor = numpy.std(im) if scale_by_std_dev else 256.
+        im /= scale_factor * (im.shape[1] * im.shape[0])
 
         debug_im = numpy.zeros(im.shape, dtype=numpy.float64)
 
         for stage_idx, stage in enumerate(self.stages):
-            print "Stage {}".format(stage_idx)
             total = 0
             for classifier in stage.weak_classifiers:
-                feature_array = self.grid.render_vec(
-                    sum(self.grid.rect_vec(r) * r.weight
+                feature_array = self.grid.render_cell_vec(
+                    sum(self.grid.rect_to_cell_vec(r) * r.weight
                                for r in self.features[classifier.feature_idx]),
                     im.shape[1], im.shape[0])
-                t = self.features[classifier.feature_idx][0].tilted
-                def do_write():
-                    cv2.imwrite("feat{:02d}.png".format(classifier.feature_idx),
-                                (feature_array + 2.) * (255. / 4))
-
-                if (numpy.sum(feature_array * im) >=
-                              classifier.threshold - epsilon):
-                    if t and classifier.fail_val > classifier.pass_val:
-                        print "{}: {} >?= {}".format(classifier.feature_idx,
-                                                     numpy.sum(feature_array * im),
-                                                     classifier.threshold - epsilon)
-                        do_write()
+                if classifier.pass_val > classifier.fail_val:
+                    thr = classifier.threshold - epsilon
+                else:
+                    thr = classifier.threshold + epsilon
+                if numpy.sum(feature_array * im) >= thr:
                     total += classifier.pass_val
                 else:
-                    if t and classifier.fail_val < classifier.pass_val:
-                        print "{}: {} >?= {}".format(classifier.feature_idx,
-                                                     numpy.sum(feature_array * im),
-                                                     classifier.threshold - epsilon)
-                        do_write()
                     total += classifier.fail_val
 
             if total < stage.threshold - epsilon:
-                print "Bailing out at stage {}".format(stage_idx)
                 return -stage_idx
         return 1
 
 
 class CascadeModel(object):
+    """
+    Model of the variables and constraints associated with a Haar cascade.
+
+    This is in fact a wrapper around a docplex model.
+
+    .. attribute:: cell_vars
+
+        List of variables corresponding with the cells in the cascade's grid.
+
+    .. attribute:: feature_vars
+
+        Dict of feature indices to binary variables. Each variable represents
+        whether the corresponding feature is present.
+
+    .. attribute:: cascade
+
+        The underlying :class:`.Cascade`.
+
+    """
     def __init__(self, cascade):
+        """Make a model from a :class:`.Cascade`."""
         model = Model("Inverse haar cascade", docloud_context=docloud_context)
 
         cell_vars = [model.continuous_var(
                         name=cascade.grid.cell_names[i],
                         lb=0., ub=1.)
-                        for i in range(cascade.grid.vec_size)]
+                        for i in range(cascade.grid.num_cells)]
         feature_vars = {idx: model.binary_var(name="feature_{}".format(idx))
                         for idx in range(len(cascade.features))}
 
         for stage in cascade.stages:
+            # Add constraints for the feature vars.
+            #
             # If the classifier's pass value is greater than its fail value,
             # then add a constraint equivalent to the following:
             #   
             #   feature var set => corresponding feature is present in image
             #
-            # This is sufficient because if a feature is present, but the
-            # corresponding feature var is not set, then setting the feature
-            # var will only help the stage constraint pass (due to the feature
-            # var appearing with a positive coefficient there).
-            #   
             # Conversely, if the classifier's pass vlaue is less than its fail
             # value, add a constraint equivalent to:
             #
             #   corresponding feature is present in image => feature var set
             for classifier in stage.weak_classifiers:
-                feature_vec = numpy.sum(cascade.grid.rect_vec(r) * r.weight
+                feature_vec = numpy.sum(
+                             cascade.grid.rect_to_cell_vec(r) * r.weight
                              for r in cascade.features[classifier.feature_idx])
                 feature_vec /= (cascade.width * cascade.height * 4.)
                 thr = classifier.threshold
@@ -286,7 +501,14 @@ class CascadeModel(object):
         self.feature_vars = feature_vars
         self.model = model
 
-    def set_best_fit_objective(self):
+    def set_objective(self):
+        """
+        Amend the model with an objective.
+
+        The objective used is to maximise the score from each stage of the
+        cascade.
+
+        """
         self.model.set_objective("max",
                     sum((c.pass_val - c.fail_val) *
                                                self.feature_vars[c.feature_idx] 
@@ -294,51 +516,62 @@ class CascadeModel(object):
                         for c in s.weak_classifiers))
 
 
-def test_cascade_detect(im, cascade_file):
-    my_cascade = Cascade.load(cascade_file)
+def inverse_haar(cascade_file, optimize=False, time_limit=None, check=False):
+    """
+    Invert a haar cascade.
 
-    im = im[:]
-    if len(im.shape) == 3:
-        gray = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
-    else:
-        assert len(im.shape) == 2
-        gray = im
+    See argument parser below for details of the arguments.
 
-    opencv_cascade = cv2.CascadeClassifier(cascade_file)
-    objs = opencv_cascade.detectMultiScale(gray, 1.3, 5)
-    for idx, (x, y, w, h) in enumerate(objs):
-        print "{} {} {} {}".format(x, y, w, h)
-        cv2.rectangle(im, (x, y), (x + w, y + h), (255, 0, 0), 2)
-        cv2.imwrite('out{:02d}.jpg'.format(idx), im)
-
-        assert my_cascade.detect(gray[y:(y + h), x:(x + w)]) == 1
-
-
-def find_min_face(cascade_file):
+    """
     cascade = Cascade.load(cascade_file)
     
     cascade_model = CascadeModel(cascade)
-    #cascade_model.model.set_objective("min",
-    #                         sum(v for v in cascade_model.pixel_vars.values()))
-    #cascade_model.set_best_fit_objective()
-    #cascade_model.model.set_time_limit(1200.)
+    if optimize:
+        cascade_model.set_objective()
+    if time_limit is not None:
+        cascade_model.model.set_time_limit(time_limit)
 
     cascade_model.model.print_information()
-    cascade_model.model.export_as_lp(basename='docplex_%s', path='/home/matt')
+    cascade_model.model.export_as_lp(basename='docplex_%s', path='.')
 
     if not cascade_model.model.solve():
         raise Exception("Failed to find solution")
-    cascade_model.model.report()
-
     sol_vec = numpy.array([v.solution_value for v in cascade_model.cell_vars])
-    return cascade_model.cascade.grid.render_vec(sol_vec,
-                                                 10 * cascade.width,
-                                                 10 * cascade.height)
+    im = cascade_model.cascade.grid.render_cell_vec(sol_vec,
+                                                    10 * cascade.width,
+                                                    10 * cascade.height)
+    im = (im * 255.).astype(numpy.uint8)
+
+    if check:
+        print "Checking..."
+        ret = cascade.detect(im)
+        if ret != 0:
+            print "Image failed the forward cascade at stage {}".format(-ret)
+
+    return im
     
+if __name__ == "__main__":
+    import argparse
 
-im = find_min_face(sys.argv[1])
-cv2.imwrite("out.png", im)
+    parser = argparse.ArgumentParser(description=
+            'Inverse haar feature object detection')
+    parser.add_argument('-c', '--cascade-file', type=str,
+                       help='OpenCV cascade file to be reversed')
+    parser.add_argument('-o', '--output', type=str,
+                       help='Output image name')
+    parser.add_argument('-t', '--time-limit', type=float, default=None,
+                       help='Maximum time to allow for optimization, in '
+                            'seconds')
+    parser.add_argument('-O', '--optimize', action='store_true',
+                        help='Try and find an optimal solution, rather than '
+                             'just a feasible solution')
+    parser.add_argument('-C', '--check', action='store_true',
+                        help='Check the result against the (forward) cascade')
 
-cascade = Cascade.load(sys.argv[1])
-assert cascade.detect(im) == 1
+    im = inverse_haar(args.cascade_file,
+                      optimize=args.optimize,
+                      time_limit=args.time_limit,
+                      check=args.check)
+
+    cv2.imwrite(args.output, im)
 
