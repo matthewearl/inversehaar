@@ -26,6 +26,7 @@ Invert OpenCV haar cascades.
 
 
 __all__ = (
+    'Cascade',
     'inverse_haar',
 )
 
@@ -201,74 +202,72 @@ class TiltedGrid(Grid):
 
 # Cascade definition
 
-Stage = collections.namedtuple('Stage', ['threshold', 'weak_classifiers'])
-Stage.__doc__ = \
-"""
-A stage in an OpenCV cascade.
+class Stage(collections.namedtuple('_StageBase',
+                                   ['threshold', 'weak_classifiers'])):
+    """
+    A stage in an OpenCV cascade.
 
-.. attribute:: weak_classifiers
+    .. attribute:: weak_classifiers
 
-    A list of weak classifiers in this stage.
+        A list of weak classifiers in this stage.
 
-.. attribute:: threshold
+    .. attribute:: threshold
 
-    The value that the weak classifiers must exceed for this stage to pass.
+        The value that the weak classifiers must exceed for this stage to pass.
 
-"""
-
-
-WeakClassifier = collections.namedtuple('WeakClassifier',
-                          ['feature_idx', 'threshold', 'fail_val', 'pass_val'])
-WeakClassifier.__doc__ = \
-"""
-A weak classifier in an OpenCV cascade.
-
-.. attribute:: feature_idx
-
-    Feature associated with this classifier.
-
-.. attribute:: threshold
-
-    The value that this feature dotted with the input image must exceed for the
-    feature to have passed.
-
-.. attribute:: fail_val
-
-    The value contributed to the stage threshold if this classifier fails.
-
-.. attribute:: pass_val
-
-    The value contributed to the stage threshold if this classifier passes.
-
-"""
+    """
 
 
-Rect = collections.namedtuple('Rect',
-                              ['x', 'y', 'w', 'h', 'tilted', 'weight'])
-Rect.__doc__ = \
-"""
-A rectangle in an OpenCV cascade.
+class WeakClassifier(collections.namedtuple('_WeakClassifierBase',
+                        ['feature_idx', 'threshold', 'fail_val', 'pass_val'])):
+    """
+    A weak classifier in an OpenCV cascade.
 
-Two or more of these make up a feature.
+    .. attribute:: feature_idx
 
-.. attribute:: x, y
-    
-    Coordinates of the rectangle.
+        Feature associated with this classifier.
 
-.. attribute:: w, h
+    .. attribute:: threshold
 
-    Width and height of the rectangle, respectively.
+        The value that this feature dotted with the input image must exceed for the
+        feature to have passed.
 
-.. attribute:: tilted
+    .. attribute:: fail_val
 
-    If true, the rectangle is to be considered rotated 45 degrees clockwise
-    about its top-left corner. (+X is right, +Y is down.)
-    
-.. attribute:: weight
+        The value contributed to the stage threshold if this classifier fails.
 
-    The value this rectangle contributes to the feature.
+    .. attribute:: pass_val
 
-"""
+        The value contributed to the stage threshold if this classifier passes.
+
+    """
+
+
+class Rect(collections.namedtuple('_RectBase',
+                                  ['x', 'y', 'w', 'h', 'tilted', 'weight'])):
+    """
+    A rectangle in an OpenCV cascade.
+
+    Two or more of these make up a feature.
+
+    .. attribute:: x, y
+        
+        Coordinates of the rectangle.
+
+    .. attribute:: w, h
+
+        Width and height of the rectangle, respectively.
+
+    .. attribute:: tilted
+
+        If true, the rectangle is to be considered rotated 45 degrees clockwise
+        about its top-left corner. (+X is right, +Y is down.)
+        
+    .. attribute:: weight
+
+        The value this rectangle contributes to the feature.
+
+    """
 
 
 class Cascade(collections.namedtuple('_CascadeBase',
@@ -516,14 +515,21 @@ class CascadeModel(object):
                         for c in s.weak_classifiers))
 
 
-def inverse_haar(cascade_file, optimize=False, time_limit=None, check=False):
+def inverse_haar(cascade, optimize=False, time_limit=None):
     """
     Invert a haar cascade.
 
-    See argument parser below for details of the arguments.
+    :param cascade:
+        A :class:`.Cascade` to invert.
+
+    :param optimize:
+        Attempt to find an optimal solution, rather than just a feasible
+        solution.
+
+    :param time_limit:
+        Maximum time to allow the solver to work, in seconds.
 
     """
-    cascade = Cascade.load(cascade_file)
     
     cascade_model = CascadeModel(cascade)
     if optimize:
@@ -542,36 +548,40 @@ def inverse_haar(cascade_file, optimize=False, time_limit=None, check=False):
                                                     10 * cascade.height)
     im = (im * 255.).astype(numpy.uint8)
 
-    if check:
-        print "Checking..."
-        ret = cascade.detect(im)
-        if ret != 0:
-            print "Image failed the forward cascade at stage {}".format(-ret)
-
     return im
-    
+
+
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description=
             'Inverse haar feature object detection')
-    parser.add_argument('-c', '--cascade-file', type=str,
+    parser.add_argument('-c', '--cascade', type=str,
                        help='OpenCV cascade file to be reversed')
     parser.add_argument('-o', '--output', type=str,
                        help='Output image name')
     parser.add_argument('-t', '--time-limit', type=float, default=None,
-                       help='Maximum time to allow for optimization, in '
+                       help='Maximum time to allow the solver to work, in '
                             'seconds')
     parser.add_argument('-O', '--optimize', action='store_true',
                         help='Try and find an optimal solution, rather than '
                              'just a feasible solution')
     parser.add_argument('-C', '--check', action='store_true',
                         help='Check the result against the (forward) cascade')
+    args = parser.parse_args()
 
-    im = inverse_haar(args.cascade_file,
+    cascade = Cascade.load(args.cascade)
+
+    im = inverse_haar(cascade,
                       optimize=args.optimize,
-                      time_limit=args.time_limit,
-                      check=args.check)
+                      time_limit=args.time_limit)
 
     cv2.imwrite(args.output, im)
+    print "Wrote {}".format(args.output)
+
+    if args.check:
+        print "Checking..."
+        ret = cascade.detect(im)
+        if ret != 0:
+            print "Image failed the forward cascade at stage {}".format(-ret)
 
