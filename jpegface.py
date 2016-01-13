@@ -44,10 +44,6 @@ from docplex.mp.model import Model
 
 
 DOCLOUD_URL = 'https://api-oaas.docloud.ibmcloud.com/job_manager/rest/v1/'
-docloud_context = DOcloudContext.make_default_context(DOCLOUD_URL)
-docloud_context.print_information()
-env = Environment()
-env.print_information()
 
 
 # Grid classes
@@ -420,7 +416,7 @@ class Cascade(collections.namedtuple('_CascadeBase',
         return 1
 
 
-class CascadeModel(object):
+class CascadeModel(Model):
     """
     Model of the variables and constraints associated with a Haar cascade.
 
@@ -440,15 +436,16 @@ class CascadeModel(object):
         The underlying :class:`.Cascade`.
 
     """
-    def __init__(self, cascade):
+    def __init__(self, cascade, docloud_context):
         """Make a model from a :class:`.Cascade`."""
-        model = Model("Inverse haar cascade", docloud_context=docloud_context)
+        super(CascadeModel, self).__init__("Inverse haar cascade",
+                                           docloud_context=docloud_context)
 
-        cell_vars = [model.continuous_var(
+        cell_vars = [self.continuous_var(
                         name=cascade.grid.cell_names[i],
                         lb=0., ub=1.)
                         for i in range(cascade.grid.num_cells)]
-        feature_vars = {idx: model.binary_var(name="feature_{}".format(idx))
+        feature_vars = {idx: self.binary_var(name="feature_{}".format(idx))
                         for idx in range(len(cascade.features))}
 
         for stage in cascade.stages:
@@ -477,20 +474,20 @@ class CascadeModel(object):
                     big_num = 0.1 + thr - numpy.sum(numpy.min(
                              [feature_vec, numpy.zeros(feature_vec.shape)],
                              axis=0))
-                    model.add_constraint(feature_val - feature_var * big_num >=
+                    self.add_constraint(feature_val - feature_var * big_num >=
                                                                  thr - big_num)
                 else:
                     big_num = 0.1 + numpy.sum(numpy.max(
                              [feature_vec, numpy.zeros(feature_vec.shape)],
                              axis=0)) - thr
-                    model.add_constraint(feature_val - feature_var * big_num <=
+                    self.add_constraint(feature_val - feature_var * big_num <=
                                                                            thr)
 
             # Enforce that the sum of features present in this stage exceeds
             # the stage threshold.
             fail_val_total = sum(c.fail_val for c in stage.weak_classifiers)
             adjusted_stage_threshold = stage.threshold
-            model.add_constraint(sum((c.pass_val - c.fail_val) *
+            self.add_constraint(sum((c.pass_val - c.fail_val) *
                                                     feature_vars[c.feature_idx] 
                          for c in stage.weak_classifiers) >=
                                      adjusted_stage_threshold - fail_val_total)
@@ -498,9 +495,8 @@ class CascadeModel(object):
         self.cascade = cascade
         self.cell_vars = cell_vars
         self.feature_vars = feature_vars
-        self.model = model
 
-    def set_objective(self):
+    def set_best_objective(self):
         """
         Amend the model with an objective.
 
@@ -508,14 +504,15 @@ class CascadeModel(object):
         cascade.
 
         """
-        self.model.set_objective("max",
+        self.set_objective("max",
                     sum((c.pass_val - c.fail_val) *
                                                self.feature_vars[c.feature_idx] 
                         for s in self.cascade.stages
                         for c in s.weak_classifiers))
 
 
-def inverse_haar(cascade, optimize=False, time_limit=None):
+def inverse_haar(cascade, optimize=False, time_limit=None,
+                 docloud_context=None, lp_path=None):
     """
     Invert a haar cascade.
 
@@ -529,18 +526,25 @@ def inverse_haar(cascade, optimize=False, time_limit=None):
     :param time_limit:
         Maximum time to allow the solver to work, in seconds.
 
+    :param docloud_context:
+        :class:`docplex.mp.context.DOcloudContext` to use for solving.
+
+    :param lp_path:
+        File to write the LP constraints to. Useful for debugging. (Optional).
+
     """
     
-    cascade_model = CascadeModel(cascade)
+    cascade_model = CascadeModel(cascade, docloud_context)
     if optimize:
-        cascade_model.set_objective()
+        cascade_model.set_best_objective()
     if time_limit is not None:
-        cascade_model.model.set_time_limit(time_limit)
+        cascade_model.set_time_limit(time_limit)
 
-    cascade_model.model.print_information()
-    cascade_model.model.export_as_lp(basename='docplex_%s', path='.')
+    cascade_model.print_information()
+    if lp_path:
+        cascade_model.export_as_lp(path=lp_path)
 
-    if not cascade_model.model.solve():
+    if not cascade_model.solve():
         raise Exception("Failed to find solution")
     sol_vec = numpy.array([v.solution_value for v in cascade_model.cell_vars])
     im = cascade_model.cascade.grid.render_cell_vec(sol_vec,
@@ -556,9 +560,9 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description=
             'Inverse haar feature object detection')
-    parser.add_argument('-c', '--cascade', type=str,
+    parser.add_argument('-c', '--cascade', type=str, required=True,
                        help='OpenCV cascade file to be reversed')
-    parser.add_argument('-o', '--output', type=str,
+    parser.add_argument('-o', '--output', type=str, required=True,
                        help='Output image name')
     parser.add_argument('-t', '--time-limit', type=float, default=None,
                        help='Maximum time to allow the solver to work, in '
@@ -568,13 +572,24 @@ if __name__ == "__main__":
                              'just a feasible solution')
     parser.add_argument('-C', '--check', action='store_true',
                         help='Check the result against the (forward) cascade')
+    parser.add_argument('-l', '--lp-path',type=str, default=None,
+                        help='File to write LP constraints to.')
     args = parser.parse_args()
 
+    print "Loading cascade..."
     cascade = Cascade.load(args.cascade)
 
+    docloud_context = DOcloudContext.make_default_context(DOCLOUD_URL)
+    docloud_context.print_information()
+    env = Environment()
+    env.print_information()
+
+    print "Solving..."
     im = inverse_haar(cascade,
                       optimize=args.optimize,
-                      time_limit=args.time_limit)
+                      time_limit=args.time_limit,
+                      docloud_context=docloud_context,
+                      lp_path=args.lp_path)
 
     cv2.imwrite(args.output, im)
     print "Wrote {}".format(args.output)
@@ -582,6 +597,6 @@ if __name__ == "__main__":
     if args.check:
         print "Checking..."
         ret = cascade.detect(im)
-        if ret != 0:
+        if ret != 1:
             print "Image failed the forward cascade at stage {}".format(-ret)
 
