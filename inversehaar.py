@@ -44,7 +44,18 @@ from docplex.mp.environment import Environment
 from docplex.mp.model import Model
 
 
+# Constants
+
+# URL to connect to DoCloud with. This may need changing to your particular
+# URL.
 DOCLOUD_URL = 'https://api-oaas.docloud.ibmcloud.com/job_manager/rest/v1/'
+
+# OpenCV preprocesses analysed regions by dividing by the standard deviation.
+# Unfortunately this step cannot be modelled with LP constraints, so we just
+# allow a reasonably high pixel value. The value is chosen as the inverse of
+# the approximate standard deviation of a face image, after it has been
+# normalized so that its minimum and maximum values are 0 and 1 respectively.
+MAX_PIXEL_VALUE = 3.0
 
 
 # Grid classes
@@ -444,7 +455,7 @@ class CascadeModel(Model):
 
         cell_vars = [self.continuous_var(
                         name=cascade.grid.cell_names[i],
-                        lb=0., ub=3.)
+                        lb=0., ub=MAX_PIXEL_VALUE)
                         for i in range(cascade.grid.num_cells)]
         feature_vars = {idx: self.binary_var(name="feature_{}".format(idx))
                         for idx in range(len(cascade.features))}
@@ -552,7 +563,7 @@ def inverse_haar(cascade, min_optimize=False, max_optimize=False,
 
     if not cascade_model.solve():
         raise Exception("Failed to find solution")
-    sol_vec = numpy.array([v.solution_value / 3.
+    sol_vec = numpy.array([v.solution_value / MAX_PIXEL_VALUE
                            for v in cascade_model.cell_vars])
     im = cascade_model.cascade.grid.render_cell_vec(sol_vec,
                                                     10 * cascade.width,
@@ -568,18 +579,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=
             'Inverse haar feature object detection')
     parser.add_argument('-c', '--cascade', type=str, required=True,
-                       help='OpenCV cascade file to be reversed')
+                       help='OpenCV cascade file to be reversed.')
     parser.add_argument('-o', '--output', type=str, required=True,
                        help='Output image name')
     parser.add_argument('-t', '--time-limit', type=float, default=None,
                        help='Maximum time to allow the solver to work, in '
-                            'seconds')
+                            'seconds.')
     parser.add_argument('-O', '--optimize', nargs='?', type=str, const='max',
-                        help='Try and find an optimal solution, rather than '
+                        help='Try and find the "best" solution, rather than '
                              'just a feasible solution. Pass "min" to find '
-                             'the minimally best solution')
+                             'the least best solution.')
     parser.add_argument('-C', '--check', action='store_true',
-                        help='Check the result against the (forward) cascade')
+                        help='Check the result against the (forward) cascade.')
     parser.add_argument('-l', '--lp-path',type=str, default=None,
                         help='File to write LP constraints to.')
     args = parser.parse_args()
