@@ -443,7 +443,7 @@ class CascadeModel(Model):
 
         cell_vars = [self.continuous_var(
                         name=cascade.grid.cell_names[i],
-                        lb=0., ub=1.)
+                        lb=0., ub=3.)
                         for i in range(cascade.grid.num_cells)]
         feature_vars = {idx: self.binary_var(name="feature_{}".format(idx))
                         for idx in range(len(cascade.features))}
@@ -464,7 +464,7 @@ class CascadeModel(Model):
                 feature_vec = numpy.sum(
                              cascade.grid.rect_to_cell_vec(r) * r.weight
                              for r in cascade.features[classifier.feature_idx])
-                feature_vec /= (cascade.width * cascade.height * 4.)
+                feature_vec /= (cascade.width * cascade.height)
                 thr = classifier.threshold
                 feature_var = feature_vars[classifier.feature_idx]
                 feature_val = sum(cell_vars[i] * feature_vec[i]
@@ -496,7 +496,7 @@ class CascadeModel(Model):
         self.cell_vars = cell_vars
         self.feature_vars = feature_vars
 
-    def set_best_objective(self):
+    def set_best_objective(self, minimize=False):
         """
         Amend the model with an objective.
 
@@ -504,24 +504,28 @@ class CascadeModel(Model):
         cascade.
 
         """
-        self.set_objective("max",
+        self.set_objective("min" if minimize else "max",
                     sum((c.pass_val - c.fail_val) *
                                                self.feature_vars[c.feature_idx] 
                         for s in self.cascade.stages
                         for c in s.weak_classifiers))
 
 
-def inverse_haar(cascade, optimize=False, time_limit=None,
-                 docloud_context=None, lp_path=None):
+def inverse_haar(cascade, min_optimize=False, max_optimize=False,
+                 time_limit=None, docloud_context=None, lp_path=None):
     """
     Invert a haar cascade.
 
     :param cascade:
         A :class:`.Cascade` to invert.
 
-    :param optimize:
-        Attempt to find an optimal solution, rather than just a feasible
-        solution.
+    :param min_optimize:
+        Attempt to the solution which exceeds the stage constraints as little
+        as possible.
+
+    :param max_optimize:
+        Attempt to the solution which exceeds the stage constraints as much
+        as possible.
 
     :param time_limit:
         Maximum time to allow the solver to work, in seconds.
@@ -533,10 +537,11 @@ def inverse_haar(cascade, optimize=False, time_limit=None,
         File to write the LP constraints to. Useful for debugging. (Optional).
 
     """
-    
+    if min_optimize and max_optimize:
+        raise ValueError("Cannot pass both min_optimize and max_optimize")
     cascade_model = CascadeModel(cascade, docloud_context)
-    if optimize:
-        cascade_model.set_best_objective()
+    if min_optimize or max_optimize:
+        cascade_model.set_best_objective(minimize=min_optimize)
     if time_limit is not None:
         cascade_model.set_time_limit(time_limit)
 
@@ -546,7 +551,8 @@ def inverse_haar(cascade, optimize=False, time_limit=None,
 
     if not cascade_model.solve():
         raise Exception("Failed to find solution")
-    sol_vec = numpy.array([v.solution_value for v in cascade_model.cell_vars])
+    sol_vec = numpy.array([v.solution_value / 3.
+                           for v in cascade_model.cell_vars])
     im = cascade_model.cascade.grid.render_cell_vec(sol_vec,
                                                     10 * cascade.width,
                                                     10 * cascade.height)
@@ -567,9 +573,10 @@ if __name__ == "__main__":
     parser.add_argument('-t', '--time-limit', type=float, default=None,
                        help='Maximum time to allow the solver to work, in '
                             'seconds')
-    parser.add_argument('-O', '--optimize', action='store_true',
+    parser.add_argument('-O', '--optimize', nargs='?', type=str, const='max',
                         help='Try and find an optimal solution, rather than '
-                             'just a feasible solution')
+                             'just a feasible solution. Pass "min" to find '
+                             'the minimally best solution')
     parser.add_argument('-C', '--check', action='store_true',
                         help='Check the result against the (forward) cascade')
     parser.add_argument('-l', '--lp-path',type=str, default=None,
@@ -586,7 +593,8 @@ if __name__ == "__main__":
 
     print "Solving..."
     im = inverse_haar(cascade,
-                      optimize=args.optimize,
+                      min_optimize=(args.optimize == "min"),
+                      max_optimize=(args.optimize == "max"),
                       time_limit=args.time_limit,
                       docloud_context=docloud_context,
                       lp_path=args.lp_path)
