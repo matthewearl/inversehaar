@@ -52,10 +52,9 @@ DOCLOUD_URL = 'https://api-oaas.docloud.ibmcloud.com/job_manager/rest/v1/'
 
 # OpenCV preprocesses analysed regions by dividing by the standard deviation.
 # Unfortunately this step cannot be modelled with LP constraints, so we just
-# allow a reasonably high pixel value. The value is chosen as the inverse of
-# the approximate standard deviation of a face image, after it has been
-# normalized so that its minimum and maximum values are 0 and 1 respectively.
-MAX_PIXEL_VALUE = 3.0
+# allow a reasonably high pixel value. This value should be at least 2, seeing
+# as the maximum standard deviation of a set of values between 0 and 1 is 0.5.
+MAX_PIXEL_VALUE = 2.0
 
 
 # Grid classes
@@ -405,8 +404,6 @@ class Cascade(collections.namedtuple('_CascadeBase',
         scale_factor = numpy.std(im) if scale_by_std_dev else 256.
         im /= scale_factor * (im.shape[1] * im.shape[0])
 
-        debug_im = numpy.zeros(im.shape, dtype=numpy.float64)
-
         for stage_idx, stage in enumerate(self.stages):
             total = 0
             for classifier in stage.weak_classifiers:
@@ -414,6 +411,7 @@ class Cascade(collections.namedtuple('_CascadeBase',
                     sum(self.grid.rect_to_cell_vec(r) * r.weight
                                for r in self.features[classifier.feature_idx]),
                     im.shape[1], im.shape[0])
+
                 if classifier.pass_val > classifier.fail_val:
                     thr = classifier.threshold - epsilon
                 else:
