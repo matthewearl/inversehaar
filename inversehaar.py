@@ -23,6 +23,9 @@
 """
 Invert OpenCV haar cascades.
 
+See http://matthewearl.github.io/2016/01/14/inverse-haar/ for an overview of
+how the code works.
+
 """
 
 
